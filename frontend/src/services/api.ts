@@ -223,7 +223,7 @@ async function request<T>(
     requestConfig = interceptor(requestConfig);
   }
 
-  let lastError: Error | null = null;
+  let lastError: unknown = null;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
@@ -236,6 +236,10 @@ async function request<T>(
 
       const responseData = await parseResponse<T>(response);
 
+      if (!response.ok) {
+        throw createHttpApiError(response, responseData.data, path);
+      }
+
       // Apply response interceptors
       let apiResponse: ApiResponse<T> = responseData;
       for (const interceptor of responseInterceptors) {
@@ -244,9 +248,9 @@ async function request<T>(
 
       return apiResponse;
     } catch (error) {
-      lastError = error as Error;
+      lastError = error;
 
-      if (attempt < maxRetries && method === 'GET') {
+      if (shouldRetry(method, attempt, maxRetries, error)) {
         const delay = RETRY_BASE_DELAY * Math.pow(2, attempt) + Math.random() * 1000;
         await new Promise(resolve => setTimeout(resolve, delay));
         continue;
@@ -292,7 +296,8 @@ async function parseResponse<T>(response: Response): Promise<ApiResponse<T>> {
 
   let data: T;
   if (contentType.includes('application/json')) {
-    data = await response.json();
+    const text = await response.text();
+    data = text ? parseJsonBody<T>(text, !response.ok) : undefined as T;
   } else if (contentType.includes('text/')) {
     data = (await response.text()) as unknown as T;
   } else if (contentType.includes('multipart/form-data')) {
@@ -308,9 +313,122 @@ async function parseResponse<T>(response: Response): Promise<ApiResponse<T>> {
     data,
     status: response.status,
     message: response.statusText,
-    requestId: response.headers.get('X-Request-ID') || undefined,
+    requestId: getHeader(response.headers, 'X-Request-ID') || undefined,
     pagination,
   };
+}
+
+function parseJsonBody<T>(text: string, allowTextFallback: boolean): T {
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    if (!allowTextFallback) {
+      throw new Error('Invalid JSON response');
+    }
+    return text as unknown as T;
+  }
+}
+
+function createHttpApiError(response: Response, body: unknown, requestPath: string): ApiError {
+  const requestId = getHeader(response.headers, 'X-Request-ID')
+    || getBodyString(body, 'requestId')
+    || getBodyString(body, 'request_id')
+    || getBodyString(body, 'traceId');
+  const path = getBodyString(body, 'path')
+    || getBodyString(body, 'endpoint')
+    || requestPath;
+
+  return {
+    code: response.status,
+    message: getErrorMessage(body) || response.statusText || `HTTP ${response.status}`,
+    details: getErrorDetails(body, response),
+    requestId,
+    timestamp: getBodyString(body, 'timestamp') || new Date().toISOString(),
+    path,
+    suggestion: getStatusSuggestion(response.status),
+  };
+}
+
+function getErrorMessage(body: unknown): string | undefined {
+  if (typeof body === 'string') {
+    const message = body.trim();
+    return message || undefined;
+  }
+
+  if (!isRecord(body)) return undefined;
+
+  for (const key of ['message', 'error', 'title', 'detail', 'reason']) {
+    const value = body[key];
+    if (typeof value === 'string' && value.trim()) {
+      return value.trim();
+    }
+  }
+
+  return undefined;
+}
+
+function getErrorDetails(body: unknown, response: Response): Record<string, unknown> {
+  const details: Record<string, unknown> = {
+    statusText: response.statusText,
+    url: response.url,
+  };
+
+  if (isRecord(body)) {
+    Object.assign(details, body);
+  } else if (body !== undefined && body !== null && body !== '') {
+    details.body = body;
+  }
+
+  return details;
+}
+
+function getStatusSuggestion(status: number): string {
+  if (status === 401) {
+    return 'Please sign in again and retry the request.';
+  }
+  if (status === 429) {
+    return 'Please wait before retrying this request.';
+  }
+  if (status >= 500) {
+    return 'Please try again later or contact support with the request ID.';
+  }
+  if (status >= 400) {
+    return 'Please check the request and try again.';
+  }
+  return 'Please try again later.';
+}
+
+function getHeader(headers: Headers, name: string): string | undefined {
+  return headers.get(name) || headers.get(name.toLowerCase()) || undefined;
+}
+
+function getBodyString(body: unknown, key: string): string | undefined {
+  if (!isRecord(body)) return undefined;
+  const value = body[key];
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isApiError(error: unknown): error is ApiError {
+  return isRecord(error)
+    && typeof error.code === 'number'
+    && typeof error.message === 'string';
+}
+
+function shouldRetry(method: string, attempt: number, maxRetries: number, error: unknown): boolean {
+  if (method !== 'GET' || attempt >= maxRetries) {
+    return false;
+  }
+
+  const apiError = normalizeError(error);
+  if (apiError.code >= 400 && apiError.code < 500 && apiError.code !== 408 && apiError.code !== 429) {
+    return false;
+  }
+
+  return true;
 }
 
 function extractPagination(headers: Headers): PaginationInfo | undefined {
@@ -331,9 +449,22 @@ function extractPagination(headers: Headers): PaginationInfo | undefined {
   };
 }
 
-function normalizeError(error: Error | null): ApiError {
+function normalizeError(error: unknown): ApiError {
   if (!error) {
     return { code: 0, message: 'Unknown error' };
+  }
+
+  if (isApiError(error)) {
+    return error;
+  }
+
+  if (!(error instanceof Error)) {
+    return {
+      code: 0,
+      message: 'An unexpected error occurred',
+      details: { originalError: error },
+      suggestion: 'Please try again later or contact support.',
+    };
   }
 
   if (error.name === 'AbortError') {
