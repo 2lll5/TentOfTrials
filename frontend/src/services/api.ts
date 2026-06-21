@@ -182,15 +182,59 @@ addResponseInterceptor(<T>(response: ApiResponse<T>): ApiResponse<T> => {
 // Default error interceptor: handles common error patterns
 addErrorInterceptor((error: ApiError): ApiError => {
   if (error.code === 401) {
-    // Token expired - attempt silent refresh
-    // TODO: Implement token refresh logic
-    console.warn('[API] Authentication failed, attempting token refresh...');
+    // Token expiry handled in request function with refresh+retry
+    console.warn('[API] Authentication failed (interceptor)');
   }
   if (error.code === 429) {
     console.warn('[API] Rate limit exceeded, retrying with backoff...');
   }
   return error;
 });
+
+/**
+ * Attempt to refresh the OAuth access token using the stored refresh token.
+ * Returns the new token string on success, or null if refresh fails.
+ * Does NOT log raw token values.
+ */
+async function refreshAccessToken(): Promise<string | null> {
+  const refreshToken = localStorage.getItem('refresh_token');
+  if (!refreshToken) {
+    console.warn('[API] No refresh token available');
+    return null;
+  }
+
+  try {
+    const response = await fetch(`${API_BASE_URL}/auth/refresh`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refreshToken }),
+    });
+
+    if (!response.ok) {
+      console.warn('[API] Token refresh failed with status', response.status);
+      localStorage.removeItem('auth_token');
+      localStorage.removeItem('refresh_token');
+      return null;
+    }
+
+    const data = await response.json();
+    const newToken = data.token || data.accessToken;
+    if (newToken) {
+      localStorage.setItem('auth_token', newToken);
+      if (data.refreshToken) {
+        localStorage.setItem('refresh_token', data.refreshToken);
+      }
+      return newToken;
+    }
+
+    return null;
+  } catch (err) {
+    console.warn('[API] Token refresh network error');
+    localStorage.removeItem('auth_token');
+    localStorage.removeItem('refresh_token');
+    return null;
+  }
+}
 
 function generateTraceId(): string {
   return `tot-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -233,6 +277,64 @@ async function request<T>(
 
       const response = await fetch(requestConfig.url, requestConfig);
       clearTimeout(timeoutId);
+
+      // Handle 401 - attempt token refresh and retry once
+      if (response.status === 401 && attempt === 0) {
+        const newToken = await refreshAccessToken();
+        if (newToken) {
+          // Update auth header and retry
+          const headers = (requestConfig.headers as Record<string, string>) || {};
+          headers['Authorization'] = `Bearer ${newToken}`;
+          requestConfig.headers = headers;
+          continue;
+        }
+        // Refresh failed - clear auth and return auth error
+        const apiError: ApiError = {
+          code: 401,
+          message: 'Authentication failed and token refresh was unsuccessful',
+          timestamp: new Date().toISOString(),
+        };
+        let processedError = apiError;
+        for (const interceptor of errorInterceptors) {
+          processedError = interceptor(processedError);
+        }
+        throw processedError;
+      }
+
+      // Non-2xx responses → normalize to ApiError and throw through error interceptor chain
+      if (!response.ok) {
+        let errorBody: Record<string, unknown> = {};
+        let errorMessage = response.statusText;
+        try {
+          const contentType = response.headers.get('content-type') || '';
+          if (contentType.includes('application/json')) {
+            const jsonBody = await response.json();
+            if (typeof jsonBody === 'object' && jsonBody !== null) {
+              errorBody = jsonBody as Record<string, unknown>;
+              errorMessage = (jsonBody as any).message || (jsonBody as any).error || errorMessage;
+            }
+          } else {
+            errorMessage = (await response.text()) || errorMessage;
+          }
+        } catch {
+          // Best-effort parsing
+        }
+
+        const apiError: ApiError = {
+          code: response.status,
+          message: errorMessage,
+          details: Object.keys(errorBody).length > 0 ? { ...errorBody } : undefined,
+          requestId: response.headers.get('X-Request-ID') || undefined,
+          path: response.url,
+          timestamp: new Date().toISOString(),
+        };
+
+        let processedError = apiError;
+        for (const interceptor of errorInterceptors) {
+          processedError = interceptor(processedError);
+        }
+        throw processedError;
+      }
 
       const responseData = await parseResponse<T>(response);
 
