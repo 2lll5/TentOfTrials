@@ -290,6 +290,36 @@ function buildUrl(path: string, params?: QueryParams): string {
 async function parseResponse<T>(response: Response): Promise<ApiResponse<T>> {
   const contentType = response.headers.get('content-type') || '';
 
+  // Reject non-2xx responses early — let error interceptors handle them
+  if (!response.ok) {
+    let errorBody: Record<string, unknown> | undefined;
+    try {
+      if (contentType.includes('application/json')) {
+        errorBody = await response.clone().json();
+      } else {
+        errorBody = { message: await response.clone().text() };
+      }
+    } catch {
+      errorBody = { message: response.statusText || 'Unknown error' };
+    }
+
+    const apiError: ApiError = {
+      code: response.status,
+      message: errorBody?.message?.toString() || response.statusText || 'Request failed',
+      details: errorBody ? { ...errorBody } : undefined,
+      requestId: response.headers.get('X-Request-ID') || undefined,
+      path: response.url,
+      suggestion: response.status === 401
+        ? 'Please log in again. Your session may have expired.'
+        : response.status === 429
+        ? 'Rate limit exceeded. Please retry after a moment.'
+        : response.status >= 500
+        ? 'Server error. Please retry later.'
+        : undefined,
+    };
+    throw apiError;
+  }
+
   let data: T;
   if (contentType.includes('application/json')) {
     data = await response.json();
@@ -298,7 +328,6 @@ async function parseResponse<T>(response: Response): Promise<ApiResponse<T>> {
   } else if (contentType.includes('multipart/form-data')) {
     data = (await response.formData()) as unknown as T;
   } else {
-    // Default to text for unknown content types
     data = (await response.text()) as unknown as T;
   }
 
