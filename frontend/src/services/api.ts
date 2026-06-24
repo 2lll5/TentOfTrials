@@ -234,6 +234,20 @@ async function request<T>(
       const response = await fetch(requestConfig.url, requestConfig);
       clearTimeout(timeoutId);
 
+      // BUGFIX: Non-2xx HTTP responses must throw an ApiError instead of
+      // being treated as successful data. The old code called parseResponse
+      // unconditionally, which returned status/data even for 4xx/5xx.
+      // Now we check response.ok and route error responses through the
+      // error interceptor chain with structured payload details preserved.
+      if (!response.ok) {
+        const errorPayload = await parseErrorResponse(response);
+        let processedError = errorPayload;
+        for (const interceptor of errorInterceptors) {
+          processedError = interceptor(processedError);
+        }
+        throw processedError;
+      }
+
       const responseData = await parseResponse<T>(response);
 
       // Apply response interceptors
@@ -285,6 +299,67 @@ function buildUrl(path: string, params?: QueryParams): string {
   }
   const qs = searchParams.toString();
   return qs ? `${baseUrl}?${qs}` : baseUrl;
+}
+
+/**
+ * Parse an error HTTP response (non-2xx) and extract structured error details
+ * from the response body. Preserves the server's error payload as structured
+ * data in the ApiError.details field.
+ */
+async function parseErrorResponse(response: Response): Promise<ApiError> {
+  const contentType = response.headers.get('content-type') || '';
+  const status = response.status;
+  let details: Record<string, unknown> | undefined;
+
+  if (contentType.includes('application/json')) {
+    try {
+      const body = await response.json();
+      // If the body itself is an error-shaped object, merge it.
+      // Otherwise wrap the whole body as details.
+      if (body && typeof body === 'object') {
+        details = body as Record<string, unknown>;
+      } else {
+        details = { body };
+      }
+    } catch {
+      details = { rawBody: '(non-json)' };
+    }
+  } else {
+    try {
+      const text = await response.text();
+      details = { rawBody: text ? text.slice(0, 2000) : '(empty)' };
+    } catch {
+      details = { rawBody: '(unreadable)' };
+    }
+  }
+
+  // Extract a message from the server's error payload if available
+  let message = response.statusText;
+  if (details && typeof details.message === 'string') {
+    message = details.message as string;
+  } else if (details && typeof details.error === 'string') {
+    message = details.error as string;
+  }
+
+  return {
+    code: status,
+    message,
+    details,
+    requestId: response.headers.get('X-Request-ID') || undefined,
+    timestamp: new Date().toISOString(),
+    path: response.url || undefined,
+    suggestion: status === 401
+      ? 'Your session may have expired. Please try logging in again.'
+      : status === 403
+        ? 'You do not have permission to perform this action.'
+        : status === 404
+          ? 'The requested resource was not found.'
+          : status === 429
+            ? 'Too many requests. Please wait before trying again.'
+            : status >= 500
+              ? 'The server encountered an internal error. Please try again later.'
+              : undefined,
+  };
 }
 
 async function parseResponse<T>(response: Response): Promise<ApiResponse<T>> {
