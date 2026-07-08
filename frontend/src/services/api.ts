@@ -223,7 +223,7 @@ async function request<T>(
     requestConfig = interceptor(requestConfig);
   }
 
-  let lastError: Error | null = null;
+  let lastError: any = null;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
@@ -233,6 +233,10 @@ async function request<T>(
 
       const response = await fetch(requestConfig.url, requestConfig);
       clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        throw await parseErrorResponse(response, path);
+      }
 
       const responseData = await parseResponse<T>(response);
 
@@ -244,7 +248,7 @@ async function request<T>(
 
       return apiResponse;
     } catch (error) {
-      lastError = error as Error;
+      lastError = error;
 
       if (attempt < maxRetries && method === 'GET') {
         const delay = RETRY_BASE_DELAY * Math.pow(2, attempt) + Math.random() * 1000;
@@ -256,7 +260,10 @@ async function request<T>(
     }
   }
 
-  const apiError = normalizeError(lastError);
+  const isApiError = (err: any): err is ApiError =>
+    err && typeof err === 'object' && 'code' in err && 'message' in err;
+
+  const apiError = isApiError(lastError) ? lastError : normalizeError(lastError);
   let processedError = apiError;
   for (const interceptor of errorInterceptors) {
     processedError = interceptor(processedError);
@@ -329,6 +336,73 @@ function extractPagination(headers: Headers): PaginationInfo | undefined {
     nextCursor: headers.get('X-Next-Cursor') || undefined,
     prevCursor: headers.get('X-Prev-Cursor') || undefined,
   };
+}
+
+async function parseErrorResponse(response: Response, path: string): Promise<ApiError> {
+  const contentType = response.headers.get('content-type') || '';
+  const status = response.status;
+  const requestId = response.headers.get('X-Request-ID') || undefined;
+
+  let message = response.statusText || `HTTP error ${status}`;
+  let details: Record<string, unknown> | undefined = undefined;
+  let parsedPath = path;
+  let serverRequestId = requestId;
+
+  try {
+    if (contentType.includes('application/json')) {
+      const json = await response.json();
+      if (json && typeof json === 'object') {
+        const payload = json.error && typeof json.error === 'object' ? json.error : json;
+        message = payload.message || payload.error || message;
+        if (payload.details && typeof payload.details === 'object') {
+          details = payload.details;
+        } else {
+          const { message: _, error: __, details: ___, requestId: rId, path: p, ...rest } = payload;
+          if (Object.keys(rest).length > 0) {
+            details = rest;
+          }
+        }
+        if (payload.requestId) serverRequestId = String(payload.requestId);
+        if (payload.path) parsedPath = String(payload.path);
+      }
+    } else {
+      const text = await response.text();
+      if (text) {
+        message = text.trim() || message;
+      }
+    }
+  } catch (e) {
+    // Keep defaults
+  }
+
+  return {
+    code: status,
+    message,
+    details,
+    requestId: serverRequestId,
+    path: parsedPath,
+    timestamp: new Date().toISOString(),
+    suggestion: getSuggestionForStatus(status),
+  };
+}
+
+function getSuggestionForStatus(status: number): string | undefined {
+  if (status === 401) {
+    return 'Please check your authentication details and try again.';
+  }
+  if (status === 403) {
+    return 'You do not have permission to access this resource.';
+  }
+  if (status === 404) {
+    return 'The requested resource could not be found.';
+  }
+  if (status === 429) {
+    return 'Too many requests. Please wait a moment before trying again.';
+  }
+  if (status >= 500) {
+    return 'An internal server error occurred. Please try again later.';
+  }
+  return undefined;
 }
 
 function normalizeError(error: Error | null): ApiError {
