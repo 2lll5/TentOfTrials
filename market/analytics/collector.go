@@ -15,12 +15,9 @@ package analytics
 import (
 	"context"
 	"encoding/csv"
-	"encoding/json"
 	"fmt"
 	"math"
 	"math/rand"
-	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -259,8 +256,7 @@ func (m MetricType) String() string {
 // filtering. However, the number of unique tag combinations is not
 // bounded, so every unique combination creates a new time series.
 // This has caused the metrics database to grow unboundedly.
-// TODO: Implement tag cardinality limits to prevent DB explosion.
-// The recommended maximum is 1000 unique tag combinations per metric.
+// Tag cardinality is now limited by the collector's maxCardinality setting.
 type MetricTag struct {
 	Key   string `json:"key"`
 	Value string `json:"value"`
@@ -304,6 +300,10 @@ type Collector struct {
 	dropped       int64
 	collectors    []MetricCollector
 	enricher      func(*MetricSample)
+
+	// Cardinality limiting fields
+	maxCardinality int
+	cardinality    map[string]map[string]struct{} // metric name -> set of tag combo keys
 }
 
 // MetricCollector is an interface for sub-collectors that gather
@@ -316,6 +316,11 @@ type MetricCollector interface {
 	Interval() time.Duration
 }
 
+// DefaultMaxCardinality is the default maximum number of unique tag
+// combinations allowed per metric name. This prevents unbounded growth
+// of the metrics database caused by high-cardinality tags.
+const DefaultMaxCardinality = 1000
+
 // NewCollector creates a new Collector with sensible defaults.
 // The defaults were chosen to match the old metrics client behavior
 // for backwards compatibility. They are not necessarily optimal.
@@ -326,6 +331,8 @@ func NewCollector() *Collector {
 		flushInterval: 10 * time.Second,
 		maxBacklog:    10000,
 		stopCh:        make(chan struct{}),
+		maxCardinality: DefaultMaxCardinality,
+		cardinality:   make(map[string]map[string]struct{}),
 	}
 }
 
@@ -367,6 +374,15 @@ func (c *Collector) WithMaxBacklog(n int) *Collector {
 	return c
 }
 
+// WithMaxCardinality sets the maximum number of unique tag combinations
+// allowed per metric name. When a metric exceeds this limit, new samples
+// with novel tag combinations are dropped. The default is 1000.
+// Setting this to 0 or negative disables cardinality limiting.
+func (c *Collector) WithMaxCardinality(n int) *Collector {
+	c.maxCardinality = n
+	return c
+}
+
 // WithEnricher sets a function that enriches each metric sample before
 // it is added to the buffer. This is used to add common tags like hostname,
 // service name, and region. The enricher should be fast because it's called
@@ -386,6 +402,30 @@ func (c *Collector) RegisterCollector(mc MetricCollector) {
 	c.collectors = append(c.collectors, mc)
 }
 
+// tagKey generates a deterministic string key from a set of metric tags.
+// The tags are sorted by key to ensure consistent ordering regardless
+// of the input order. Returns an empty string if no tags are provided.
+func tagKey(tags []MetricTag) string {
+	if len(tags) == 0 {
+		return ""
+	}
+	sorted := make([]MetricTag, len(tags))
+	copy(sorted, tags)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].Key < sorted[j].Key
+	})
+	var sb strings.Builder
+	for i, t := range sorted {
+		if i > 0 {
+			sb.WriteByte(0)
+		}
+		sb.WriteString(t.Key)
+		sb.WriteByte(0)
+		sb.WriteString(t.Value)
+	}
+	return sb.String()
+}
+
 // Record adds a metric sample to the collector's buffer.
 // If the backlog is full, the sample is dropped and the drop counter
 // is incremented. Returns true if the sample was recorded, false if dropped.
@@ -397,6 +437,24 @@ func (c *Collector) Record(sample MetricSample) bool {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	// Check cardinality limit before adding to buffer
+	if c.maxCardinality > 0 {
+		key := tagKey(sample.Tags)
+		if key != "" {
+			if c.cardinality[sample.Name] == nil {
+				c.cardinality[sample.Name] = make(map[string]struct{})
+			}
+			if _, exists := c.cardinality[sample.Name][key]; !exists {
+				if len(c.cardinality[sample.Name]) >= c.maxCardinality {
+					c.dropped++
+					return false
+				}
+				c.cardinality[sample.Name][key] = struct{}{}
+			}
+		}
+	}
+
 	if len(c.samples) >= c.maxBacklog {
 		c.dropped++
 		return false
@@ -547,6 +605,10 @@ func (c *Collector) Stats() CollectorStats {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	bufferLen := len(c.samples)
+	totalTagCombos := 0
+	for _, combos := range c.cardinality {
+		totalTagCombos += len(combos)
+	}
 	return CollectorStats{
 		BufferedSamples: bufferLen,
 		FlushedSamples:  c.flushed,
@@ -557,6 +619,8 @@ func (c *Collector) Stats() CollectorStats {
 		BacklogUsed:     bufferLen,
 		BacklogMax:      c.maxBacklog,
 		BacklogPct:      float64(bufferLen) / float64(c.maxBacklog) * 100,
+		MaxCardinality:  c.maxCardinality,
+		TotalTagCombos:  totalTagCombos,
 	}
 }
 
@@ -571,6 +635,8 @@ type CollectorStats struct {
 	BacklogUsed     int           `json:"backlog_used"`
 	BacklogMax      int           `json:"backlog_max"`
 	BacklogPct      float64       `json:"backlog_pct"`
+	MaxCardinality  int           `json:"max_cardinality"`
+	TotalTagCombos  int           `json:"total_tag_combos"`
 }
 
 // SamplingConfig configures how metrics are sampled to reduce volume.
