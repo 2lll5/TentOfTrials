@@ -234,6 +234,16 @@ async function request<T>(
       const response = await fetch(requestConfig.url, requestConfig);
       clearTimeout(timeoutId);
 
+      // Non-2xx responses are errors — parse, run through error interceptors, and throw
+      if (!response.ok) {
+        const apiError = await parseErrorResponse(response);
+        let processedError = apiError;
+        for (const interceptor of errorInterceptors) {
+          processedError = interceptor(processedError);
+        }
+        throw processedError;
+      }
+
       const responseData = await parseResponse<T>(response);
 
       // Apply response interceptors
@@ -244,6 +254,12 @@ async function request<T>(
 
       return apiResponse;
     } catch (error) {
+      // If this is an HTTP error (non-2xx response), throw immediately
+      // without retrying — HTTP errors are deterministic, not transient.
+      if (isApiError(error)) {
+        throw error;
+      }
+
       lastError = error as Error;
 
       if (attempt < maxRetries && method === 'GET') {
@@ -313,6 +329,54 @@ async function parseResponse<T>(response: Response): Promise<ApiResponse<T>> {
   };
 }
 
+async function parseErrorResponse(response: Response): Promise<ApiError> {
+  const requestId = response.headers.get('X-Request-ID') || undefined;
+  const contentType = response.headers.get('content-type') || '';
+
+  let message = response.statusText || 'Request failed';
+  let details: Record<string, unknown> | undefined;
+
+  try {
+    if (contentType.includes('application/json')) {
+      const body = await response.json();
+      message = body.message || body.error || body.detail || message;
+      details = body.details || body.errors || body;
+    } else {
+      const text = await response.text();
+      if (text) {
+        message = text;
+      }
+    }
+  } catch {
+    // Body parsing failed — use statusText fallback
+  }
+
+  const error: ApiError = {
+    code: response.status,
+    message,
+    requestId,
+    path: response.url,
+  };
+
+  if (details !== undefined) {
+    error.details = details;
+  }
+
+  if (response.status === 401) {
+    error.suggestion = 'Please log in again or refresh your session.';
+  } else if (response.status === 429) {
+    error.suggestion = 'Rate limit exceeded. Please wait before retrying.';
+  } else if (response.status >= 500) {
+    error.suggestion = 'Server error. Please try again later or contact support.';
+  } else if (response.status === 404) {
+    error.suggestion = 'The requested resource was not found.';
+  } else if (response.status === 403) {
+    error.suggestion = 'You do not have permission to perform this action.';
+  }
+
+  return error;
+}
+
 function extractPagination(headers: Headers): PaginationInfo | undefined {
   const page = headers.get('X-Page');
   const perPage = headers.get('X-Per-Page');
@@ -329,6 +393,18 @@ function extractPagination(headers: Headers): PaginationInfo | undefined {
     nextCursor: headers.get('X-Next-Cursor') || undefined,
     prevCursor: headers.get('X-Prev-Cursor') || undefined,
   };
+}
+
+function isApiError(error: unknown): error is ApiError {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    'message' in error &&
+    typeof (error as ApiError).code === 'number' &&
+    // Exclude DOMException and other native objects that also have code/message
+    !('name' in error && typeof (error as any).name === 'string' && (error as any).name.includes('Error'))
+  );
 }
 
 function normalizeError(error: Error | null): ApiError {
