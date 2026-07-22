@@ -243,7 +243,8 @@ async function request<T>(
 
       const responseData = await parseResponse<T>(response);
 
-      if (response.status >= 400) {
+      // Reject ALL non-2xx HTTP responses as errors
+      if (response.status < 200 || response.status >= 300) {
         const apiError = responseToApiError<T>(responseData, path);
         let processedError = apiError;
         for (const interceptor of errorInterceptors) {
@@ -252,7 +253,7 @@ async function request<T>(
         throw new HttpError(processedError);
       }
 
-      // Apply response interceptors
+      // Apply response interceptors only for successful 2xx responses
       let apiResponse: ApiResponse<T> = responseData;
       for (const interceptor of responseInterceptors) {
         apiResponse = interceptor(apiResponse);
