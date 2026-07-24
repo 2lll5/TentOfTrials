@@ -92,6 +92,13 @@ export interface ApiError {
   suggestion?: string;
 }
 
+class HttpError extends Error {
+  constructor(public apiError: ApiError) {
+    super(apiError.message);
+    this.name = 'HttpError';
+  }
+}
+
 export interface RequestConfig {
   timeout?: number;
   retries?: number;
@@ -236,7 +243,17 @@ async function request<T>(
 
       const responseData = await parseResponse<T>(response);
 
-      // Apply response interceptors
+      // Reject ALL non-2xx HTTP responses as errors
+      if (response.status < 200 || response.status >= 300) {
+        const apiError = responseToApiError<T>(responseData, path);
+        let processedError = apiError;
+        for (const interceptor of errorInterceptors) {
+          processedError = interceptor(processedError);
+        }
+        throw new HttpError(processedError);
+      }
+
+      // Apply response interceptors only for successful 2xx responses
       let apiResponse: ApiResponse<T> = responseData;
       for (const interceptor of responseInterceptors) {
         apiResponse = interceptor(apiResponse);
@@ -244,6 +261,10 @@ async function request<T>(
 
       return apiResponse;
     } catch (error) {
+      if (error instanceof HttpError) {
+        throw error.apiError;
+      }
+
       lastError = error as Error;
 
       if (attempt < maxRetries && method === 'GET') {
@@ -329,6 +350,55 @@ function extractPagination(headers: Headers): PaginationInfo | undefined {
     nextCursor: headers.get('X-Next-Cursor') || undefined,
     prevCursor: headers.get('X-Prev-Cursor') || undefined,
   };
+}
+
+function responseToApiError<T>(responseData: ApiResponse<T>, path: string): ApiError {
+  const status = responseData.status;
+  const body = responseData.data;
+
+  let message = responseData.message || `HTTP ${status}`;
+  let details: Record<string, unknown> | undefined;
+  let requestId = responseData.requestId;
+  let suggestion: string | undefined;
+  let code = status;
+
+  if (body !== null && body !== undefined) {
+    if (typeof body === 'object' && !Array.isArray(body)) {
+      const err = body as Record<string, unknown>;
+      if (typeof err.message === 'string') message = err.message;
+      if (typeof err.error === 'string' && message === responseData.message) message = err.error;
+      if (err.details && typeof err.details === 'object') details = err.details as Record<string, unknown>;
+      if (typeof err.requestId === 'string') requestId = err.requestId;
+      if (typeof err.suggestion === 'string') suggestion = err.suggestion;
+      if (typeof err.code === 'number') code = err.code;
+      if (!details && err.errors && Array.isArray(err.errors)) {
+        details = { validationErrors: err.errors };
+      }
+    } else if (typeof body === 'string' && body.length > 0) {
+      if (message === responseData.message || !responseData.message) {
+        message = body;
+      }
+    }
+  }
+
+  return {
+    code,
+    message,
+    details,
+    requestId,
+    path,
+    suggestion: suggestion || getDefaultSuggestion(status),
+    timestamp: new Date().toISOString(),
+  };
+}
+
+function getDefaultSuggestion(status: number): string | undefined {
+  if (status === 401) return 'Please try logging in again.';
+  if (status === 403) return 'You do not have permission to access this resource.';
+  if (status === 404) return 'The requested resource was not found.';
+  if (status === 429) return 'Please wait a moment before making more requests.';
+  if (status >= 500) return 'The server encountered an error. Please try again later.';
+  return undefined;
 }
 
 function normalizeError(error: Error | null): ApiError {
