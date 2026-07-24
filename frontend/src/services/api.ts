@@ -234,9 +234,17 @@ async function request<T>(
       const response = await fetch(requestConfig.url, requestConfig);
       clearTimeout(timeoutId);
 
+      if (!response.ok) {
+        const apiError = await parseErrorResponse(response);
+        let processedError = apiError;
+        for (const interceptor of errorInterceptors) {
+          processedError = interceptor(processedError);
+        }
+        throw processedError;
+      }
+
       const responseData = await parseResponse<T>(response);
 
-      // Apply response interceptors
       let apiResponse: ApiResponse<T> = responseData;
       for (const interceptor of responseInterceptors) {
         apiResponse = interceptor(apiResponse);
@@ -298,7 +306,6 @@ async function parseResponse<T>(response: Response): Promise<ApiResponse<T>> {
   } else if (contentType.includes('multipart/form-data')) {
     data = (await response.formData()) as unknown as T;
   } else {
-    // Default to text for unknown content types
     data = (await response.text()) as unknown as T;
   }
 
@@ -310,6 +317,37 @@ async function parseResponse<T>(response: Response): Promise<ApiResponse<T>> {
     message: response.statusText,
     requestId: response.headers.get('X-Request-ID') || undefined,
     pagination,
+  };
+}
+
+async function parseErrorResponse(response: Response): Promise<ApiError> {
+  const contentType = response.headers.get('content-type') || '';
+  const requestId = response.headers.get('X-Request-ID') || undefined;
+  let message = response.statusText;
+  let details: Record<string, unknown> | undefined;
+
+  if (contentType.includes('application/json')) {
+    try {
+      const body = await response.json();
+      message = body.message || body.error || message;
+      details = body.details || body;
+    } catch {
+      message = response.statusText;
+    }
+  } else if (contentType.includes('text/')) {
+    try {
+      const text = await response.text();
+      if (text) message = text;
+    } catch {
+    }
+  }
+
+  return {
+    code: response.status,
+    message,
+    details,
+    requestId,
+    path: response.url,
   };
 }
 
