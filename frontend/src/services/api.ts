@@ -102,6 +102,124 @@ export interface RequestConfig {
   withCredentials?: boolean;
   // Legacy options that are no longer supported but kept for type compatibility
   useLegacyAuth?: boolean;
+}
+
+/**
+ * Represents a normalized API error returned by the backend.
+ */
+export interface ApiError extends Error {
+  code: number;
+  message: string;
+  requestId?: string;
+  details?: Record<string, unknown>;
+  path?: string;
+  suggestion?: string;
+}
+
+/**
+ * Represents a successful API response.
+ */
+export interface ApiResponse<T> {
+  data: T;
+  status: number;
+  requestId?: string;
+}
+
+/**
+ * Normalizes fetch responses to either ApiResponse or throws ApiError.
+ * Handles JSON and text error bodies, preserves request IDs and status codes.
+ */
+export async function request<T>(
+  input: RequestInfo,
+  init?: RequestInit & RequestConfig
+): Promise<ApiResponse<T>> {
+  const response = await fetch(input, init);
+
+  const contentType = response.headers.get('content-type') || '';
+  const isJson = contentType.includes('application/json');
+
+  if (response.ok) {
+    // Successful 2xx response
+    if (isJson) {
+      const json = await response.json();
+      return {
+        data: json as T,
+        status: response.status,
+        requestId: response.headers.get('X-Request-Id') || undefined,
+      };
+    } else if (init?.responseType === 'text') {
+      const text = await response.text();
+      return {
+        data: text as unknown as T,
+        status: response.status,
+        requestId: response.headers.get('X-Request-Id') || undefined,
+      };
+    } else if (init?.responseType === 'blob') {
+      const blob = await response.blob();
+      return {
+        data: blob as unknown as T,
+        status: response.status,
+        requestId: response.headers.get('X-Request-Id') || undefined,
+      };
+    } else {
+      // Fallback to text
+      const text = await response.text();
+      return {
+        data: text as unknown as T,
+        status: response.status,
+        requestId: response.headers.get('X-Request-Id') || undefined,
+      };
+    }
+  } else {
+    // Non-2xx response: parse error body and throw ApiError
+    let errorMessage = `HTTP error ${response.status}`;
+    let errorDetails: Record<string, unknown> | undefined;
+    let requestId = response.headers.get('X-Request-Id') || undefined;
+    let errorPath: string | undefined;
+    let errorSuggestion: string | undefined;
+
+    try {
+      if (isJson) {
+        const errorJson = await response.json();
+        if (typeof errorJson === 'object' && errorJson !== null) {
+          if (typeof errorJson.message === 'string') {
+            errorMessage = errorJson.message;
+          }
+          if (typeof errorJson.details === 'object' && errorJson.details !== null) {
+            errorDetails = errorJson.details;
+          }
+          if (typeof errorJson.request_id === 'string') {
+            requestId = errorJson.request_id;
+          }
+          if (typeof errorJson.path === 'string') {
+            errorPath = errorJson.path;
+          }
+          if (typeof errorJson.suggestion === 'string') {
+            errorSuggestion = errorJson.suggestion;
+          }
+        }
+      } else {
+        // Try to parse as text
+        const text = await response.text();
+        if (text) {
+          errorMessage = text;
+        }
+      }
+    } catch {
+      // Ignore parse errors, keep default message
+    }
+
+    const error: ApiError = new Error(errorMessage) as ApiError;
+    error.code = response.status;
+    error.message = errorMessage;
+    error.requestId = requestId;
+    error.details = errorDetails;
+    error.path = errorPath;
+    error.suggestion = errorSuggestion;
+
+    throw error;
+  }
+}
   enableRetry?: boolean;
   transformResponse?: boolean;
 }
