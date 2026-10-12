@@ -43,12 +43,13 @@ import os
 import re
 import sys
 import time
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from itertools import chain
 from pathlib import Path
 from typing import Any, Counter, Dict, List, Optional, Tuple
 from collections import defaultdict, Counter
-
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 logger = logging.getLogger("log_aggregator")
 
@@ -116,11 +117,12 @@ class LogParser:
 class JSONLogParser(LogParser):
     """Parses structured JSON log lines."""
 
+class JSONLogParser(LogParser):
+    """Parser for JSON-formatted log lines."""
+
     def parse(self, line: str) -> Optional[Dict[str, Any]]:
         try:
-            entry = json.loads(line.strip())
-            if not isinstance(entry, dict):
-                return None
+            data = json.loads(line)
             return {
                 'timestamp': entry.get('timestamp') or entry.get('time') or entry.get('@timestamp'),
                 'level': entry.get('level') or entry.get('severity') or entry.get('lvl', 'info'),
@@ -134,24 +136,26 @@ class JSONLogParser(LogParser):
 
 
 class TextLogParser(LogParser):
-    """Parses plain text log lines."""
+
+class PlainTextLogParser(LogParser):
+    """Parser for plain text log lines."""
 
     def parse(self, line: str) -> Optional[Dict[str, Any]]:
-        line = line.strip()
-        if not line:
-            return None
+        entry = {
+            'timestamp': self.extract_timestamp(line),
 
         return {
             'timestamp': self.extract_timestamp(line),
             'level': self.extract_level(line),
             'service': self.extract_service(line),
             'message': line,
-            'fields': {'raw': line},
-            'format': 'text',
-        }
 
+class SyslogParser(LogParser):
+    """Parser for syslog-formatted log lines."""
 
-class NginxLogParser(LogParser):
+    def parse(self, line: str) -> Optional[Dict[str, Any]]:
+        entry = {
+            'timestamp': self.extract_timestamp(line),
     """Parses Nginx access log format."""
 
     NGINX_PATTERN = re.compile(
@@ -160,12 +164,13 @@ class NginxLogParser(LogParser):
         r'(\S+)\s+'
         r'\[([^\]]+)\]\s+'
         r'"([^"]*)"\s+'
-        r'(\d+)\s+'
-        r'(\d+)\s+'
-        r'"([^"]*)"\s+'
-        r'"([^"]*)"'
-    )
 
+class S3LogParser(LogParser):
+    """Parser for S3 access log lines."""
+
+    def parse(self, line: str) -> Optional[Dict[str, Any]]:
+        parts = line.split(' ')
+        if len(parts) < 8:
     def parse(self, line: str) -> Optional[Dict[str, Any]]:
         match = self.NGINX_PATTERN.match(line)
         if not match:
@@ -193,12 +198,13 @@ class NginxLogParser(LogParser):
                 'body_bytes': match.group(7),
                 'referer': match.group(8),
                 'user_agent': match.group(9),
-            },
-            'format': 'nginx',
-        }
 
+class LogAggregator:
+    """Aggregates log entries by various dimensions."""
 
-# ---------------------------------------------------------------------------
+    def __init__(self):
+        self.entries: List[Dict[str, Any]] = []
+        self.by_service: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 # AGGREGATOR
 # ---------------------------------------------------------------------------
 
@@ -251,12 +257,13 @@ class LogAggregator:
                     self.hourly_counts[hour] += 1
                 level = entry.get('level', 'unknown').lower()
                 self.level_counts[level] += 1
-                service = entry.get('service', 'unknown')
-                self.service_counts[service] += 1
-                if level in ('error', 'critical'):
-                    msg = entry.get('message', '')
-                    if len(msg) > 200:
-                        msg = msg[:200]
+
+class ReportGenerator:
+    """Generates analysis reports from aggregated log data."""
+
+    def __init__(self, aggregator: LogAggregator):
+        self.aggregator = aggregator
+
                     self.errors_by_service[service].append(msg)
                     self.error_patterns[msg] += 1
                 return True

@@ -11,19 +11,21 @@ This tool is used by:
   - The on-call engineer (manual troubleshooting)
 
 The health check performs the following checks:
-  1. Service availability (HTTP health endpoints)
-  2. Database connectivity (connection test)
-  3. Redis connectivity (ping test)
-  4. Kafka connectivity (metadata fetch)
-  5. Message queue depth (consumer lag check)
-  6. Certificate expiry (TLS certificate check)
+import json
+import os
+import socket
+import shutil
+import ssl
+import subprocess
+import sys
   7. Disk space (filesystem usage check)
-  8. Memory usage (process memory check)
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
 
-Each check returns a status of OK, WARNING, or CRITICAL, along with
-a detail message and optional diagnostic data.
 
-Usage:
+# ---------------------------------------------------------------------------
+# CONSTANTS
+# ---------------------------------------------------------------------------
     python3 health_check.py                  # Check all services
     python3 health_check.py --service backend # Check specific service
     python3 health_check.py --json            # JSON output
@@ -140,12 +142,13 @@ def check_disk_usage(path: str = "/") -> Tuple[str, str, float]:
         pct = (used / total) * 100
 
         if pct < DISK_THRESHOLD_WARNING:
-            return "OK", f"{pct:.1f}% used ({used // (1024**3)}GB/{total // (1024**3)}GB)", pct
-        elif pct < DISK_THRESHOLD_CRITICAL:
-            return "WARNING", f"{pct:.1f}% used ({used // (1024**3)}GB/{total // (1024**3)}GB)", pct
-        else:
-            return "CRITICAL", f"{pct:.1f}% used ({used // (1024**3)}GB/{total // (1024**3)}GB)", pct
-    except Exception as e:
+def check_disk_space(path: str = "/") -> Tuple[str, str, Dict[str, Any]]:
+    """Check disk usage for the given path."""
+    try:
+        import shutil
+        usage = shutil.disk_usage(path)
+        total = usage.total
+        used = usage.used
         return "WARNING", f"Cannot check: {e}", 0
 
 
@@ -160,12 +163,13 @@ def check_memory_usage() -> Tuple[str, str, float]:
                     value = parts[1].strip().replace(" kB", "")
                     try:
                         meminfo[key] = int(value) * 1024
-                    except ValueError:
-                        pass
+def check_memory_usage() -> Tuple[str, str, Dict[str, Any]]:
+    """Check system memory usage."""
+    try:
+        # Linux path: read /proc/meminfo
+        with open("/proc/meminfo", "r") as f:
+            meminfo = f.read()
 
-        total = meminfo.get("MemTotal", 0)
-        available = meminfo.get("MemAvailable", 0)
-        used = total - available
         pct = (used / total) * 100 if total > 0 else 0
 
         if pct < MEMORY_THRESHOLD_WARNING:
@@ -191,16 +195,65 @@ def check_load_average() -> Tuple[str, str, float]:
             elif load_pct < 90:
                 return "WARNING", f"Load: {load} ({load_pct:.0f}% of {cpu_count} cores)", load
             else:
-                return "CRITICAL", f"Load: {load} ({load_pct:.0f}% of {cpu_count} cores)", load
+            "available_mb": available_mb,
+            "percent_used": percent_used,
+        }
+    except FileNotFoundError:
+        # Non-Linux fallback using psutil if available
+        try:
+            import psutil
+            mem = psutil.virtual_memory()
+            total_mb = mem.total / (1024 * 1024)
+            available_mb = mem.available / (1024 * 1024)
+            used_mb = total_mb - available_mb
+            percent_used = mem.percent
+
+            if percent_used >= MEMORY_THRESHOLD_CRITICAL:
+                result = "CRITICAL"
+            elif percent_used >= MEMORY_THRESHOLD_WARNING:
+                result = "WARNING"
+            else:
+                result = "OK"
+
+            detail = f"Memory {percent_used:.1f}% used ({used_mb:.0f}/{total_mb:.0f} MB)"
+
+            return result, detail, {
+                "total_mb": total_mb,
+                "used_mb": used_mb,
+                "available_mb": available_mb,
+                "percent_used": percent_used,
+            }
+        except ImportError:
+            # Final fallback: try to use os-level info or return warning
+            return "WARNING", "Memory check unavailable on this platform (psutil not installed)", {}
     except Exception as e:
-        return "WARNING", f"Cannot check: {e}", 0
+        return "CRITICAL", f"Memory check failed: {e}", {}
+
+
+def check_load_average() -> Tuple[str, str, Dict[str, Any]]:
+    """Check system load average."""
+    try:
+        # Linux path: read /proc/loadavg
+        with open("/proc/loadavg", "r") as f:
+            load_data = f.read().strip()
+        load1, load5, load15 = load_data.split()[:3]
+        detail = f"Load average: {load1} (1min), {load5} (5min), {load15} (15min)"
+        return "OK", detail, {"load1": float(load1), "load5": float(load5), "load15": float(load15)}
+    except FileNotFoundError:
+        # Non-Linux fallback using os.getloadavg()
+        try:
+            load1, load5, load15 = os.getloadavg()
+            detail = f"Load average: {load1:.2f} (1min), {load5:.2f} (5min), {load15:.2f} (15min)"
+            return "OK", detail, {"load1": load1, "load5": load5, "load15": load15}
+        except (AttributeError, OSError):
+            return "WARNING", "Load average check unavailable on this platform", {}
+    except Exception as e:
+        return "CRITICAL", f"Load average check failed: {e}", {}
 
 
 # ---------------------------------------------------------------------------
-# HEALTH CHECK RUNNER
+# MAIN
 # ---------------------------------------------------------------------------
-
-def run_health_checks(service: Optional[str] = None, json_output: bool = False) -> Dict[str, Any]:
     results: Dict[str, Any] = {
         "timestamp": datetime.now().isoformat(),
         "hostname": socket.gethostname(),
@@ -247,12 +300,16 @@ def run_health_checks(service: Optional[str] = None, json_output: bool = False) 
     if disk_status == "CRITICAL":
         all_ok = False
 
-    mem_status, mem_detail, mem_pct = check_memory_usage()
-    results["system"]["memory"] = {"status": mem_status, "detail": mem_detail}
-    if mem_status == "CRITICAL":
-        all_ok = False
+    disk_result, disk_detail, disk_data = check_disk_space()
+    print(f"  Disk: {disk_result} - {disk_detail}")
 
-    load_status, load_detail, load_val = check_load_average()
+    # Memory check
+    mem_result, mem_detail, mem_data = check_memory_usage()
+    print(f"  Memory: {mem_result} - {mem_detail}")
+
+    # Overall status
+    overall = "OK"
+    for service, result in results.items():
     results["system"]["load"] = {"status": load_status, "detail": load_detail}
 
     # Check certificate expiry (web services)
@@ -267,22 +324,24 @@ def run_health_checks(service: Optional[str] = None, json_output: bool = False) 
                 "days_remaining": days_left,
             }
             if cert_status == "CRITICAL":
-                all_ok = False
-
-    results["overall_status"] = "OK" if all_ok else "DEGRADED"
-
-    return results
-
+            "checks": {
+                "services": {name: {"status": r[0], "detail": r[1], "latency_ms": r[2]} for name, r in results.items()},
+                "disk": {"status": disk_result, "detail": disk_detail, "data": disk_data},
+                "memory": {"status": mem_result, "detail": mem_detail, "data": mem_data},
+            },
+            "overall": overall,
+        }
 
 def print_health_report(results: Dict[str, Any]):
     print(f"\n{'='*60}")
     print(f"  HEALTH CHECK REPORT")
-    print(f"  Host: {results['hostname']}")
-    print(f"  Time: {results['timestamp']}")
-    print(f"  Overall: {results['overall_status']}")
-    print(f"{'='*60}")
+        print(f"\nOverall: {overall}")
+        print(f"  Services checked: {len(results)}")
+        print(f"  Disk: {disk_result}")
+        print(f"  Memory: {mem_result}")
 
-    for category, items in [("Services", results["services"]),
+
+if __name__ == "__main__":
                              ("Infrastructure", results["infrastructure"]),
                              ("System", results["system"])]:
         if items:
