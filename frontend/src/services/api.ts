@@ -224,6 +224,7 @@ async function request<T>(
   }
 
   let lastError: Error | null = null;
+  let lastApiError: ApiError | null = null;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
@@ -233,6 +234,11 @@ async function request<T>(
 
       const response = await fetch(requestConfig.url, requestConfig);
       clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        lastApiError = await normalizeHttpError(response, requestConfig.url);
+        break;
+      }
 
       const responseData = await parseResponse<T>(response);
 
@@ -244,6 +250,11 @@ async function request<T>(
 
       return apiResponse;
     } catch (error) {
+      if (isApiError(error)) {
+        lastApiError = error;
+        break;
+      }
+
       lastError = error as Error;
 
       if (attempt < maxRetries && method === 'GET') {
@@ -256,7 +267,7 @@ async function request<T>(
     }
   }
 
-  const apiError = normalizeError(lastError);
+  const apiError = lastApiError ?? normalizeError(lastError);
   let processedError = apiError;
   for (const interceptor of errorInterceptors) {
     processedError = interceptor(processedError);
@@ -329,6 +340,78 @@ function extractPagination(headers: Headers): PaginationInfo | undefined {
     nextCursor: headers.get('X-Next-Cursor') || undefined,
     prevCursor: headers.get('X-Prev-Cursor') || undefined,
   };
+}
+
+function isApiError(error: unknown): error is ApiError {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    typeof (error as ApiError).code === 'number' &&
+    'message' in error &&
+    typeof (error as ApiError).message === 'string'
+  );
+}
+
+async function normalizeHttpError(response: Response, requestUrl: string): Promise<ApiError> {
+  const contentType = response.headers.get('content-type') || '';
+  const requestId = response.headers.get('X-Request-ID') || response.headers.get('X-Correlation-ID') || undefined;
+  const fallbackPath = getPathFromUrl(requestUrl);
+
+  if (contentType.includes('application/json')) {
+    try {
+      const payload = await response.json();
+      if (payload && typeof payload === 'object') {
+        const body = payload as Record<string, unknown>;
+        const details = typeof body.details === 'object' && body.details !== null
+          ? body.details as Record<string, unknown>
+          : body;
+
+        return {
+          code: response.status,
+          message: getString(body.message) || getString(body.error) || response.statusText || 'HTTP error',
+          details,
+          requestId: getString(body.requestId) || requestId,
+          timestamp: getString(body.timestamp),
+          path: getString(body.path) || fallbackPath,
+          suggestion: getString(body.suggestion),
+        };
+      }
+    } catch {
+      return {
+        code: response.status,
+        message: 'Invalid JSON error response',
+        details: { statusText: response.statusText },
+        requestId,
+        path: fallbackPath,
+        suggestion: 'Please try again later or contact support with the request ID.',
+      };
+    }
+  }
+
+  const text = await response.text();
+  return {
+    code: response.status,
+    message: text.trim() || response.statusText || 'HTTP error',
+    details: text.trim() ? { body: text } : { statusText: response.statusText },
+    requestId,
+    path: fallbackPath,
+    suggestion: response.status >= 500
+      ? 'Please try again later or contact support with the request ID.'
+      : undefined,
+  };
+}
+
+function getString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
+function getPathFromUrl(url: string): string | undefined {
+  try {
+    return new URL(url).pathname;
+  } catch {
+    return undefined;
+  }
 }
 
 function normalizeError(error: Error | null): ApiError {

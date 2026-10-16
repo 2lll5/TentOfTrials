@@ -278,6 +278,32 @@ Audit logs are retained for 365 days and include:
 
 ## Troubleshooting
 
+### Frontend API Error Semantics
+
+The legacy frontend API client rejects non-2xx HTTP responses as structured
+`ApiError` values instead of passing them through the successful response
+interceptor chain. This keeps callers from accidentally treating backend
+validation, authentication, rate-limit, or server failures as valid
+`ApiResponse<T>` payloads.
+
+Normalized HTTP errors include the status code, message, request ID when the
+backend provides one, path, and either parsed JSON details or the raw text body.
+JSON error payloads may provide `message`, `error`, `details`, `requestId`,
+`timestamp`, `path`, and `suggestion`. Plain-text responses are preserved in
+`details.body`. Timeout and network failures continue to use the existing
+client-side normalization path.
+
+Operational checks:
+
+```bash
+cd frontend
+npm run build
+```
+
+When debugging production incidents, search logs by the propagated
+`X-Request-ID` value first. For 401 and 429 responses, confirm the default error
+interceptors ran before inspecting caller-specific handling.
+
 ### Common Issues
 
 **Service won't start**
