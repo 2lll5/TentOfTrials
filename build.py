@@ -14,6 +14,27 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+# Reconfigure stdout/stderr to UTF-8 on Windows to avoid UnicodeEncodeError on emojis
+if sys.stdout.encoding.lower() != 'utf-8':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+if sys.stderr.encoding.lower() != 'utf-8':
+    try:
+        sys.stderr.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+
+# Fix for encryptly failing/hanging on Windows if home path has spaces
+if platform.system().lower() == "windows" and " " in str(Path.home()):
+    public_dir = Path("C:/Users/Public")
+    if public_dir.exists():
+        os.environ["USERPROFILE"] = str(public_dir)
+        os.environ["HOME"] = str(public_dir)
+        os.environ["HOMEPATH"] = "\\Users\\Public"
+        os.environ["HOMEDRIVE"] = "C:"
+
 ROOT = Path(__file__).resolve().parent
 DIAGNOSTIC_DIR = ROOT / "diagnostic"
 DIAGNOSTIC_CHUNK_SIZE = 40 * 1024 * 1024
@@ -230,7 +251,7 @@ def check_encryptly_runs(timeout: int = 60) -> tuple[bool, str]:
 
     workspace = Path.home() / ".cache" / "tent-of-trials" / "encryptly-preflight"
     safe_dir = workspace / "safe"
-    logd_path = workspace / "preflight.logd"
+    logd_path = Path.home() / ".cache" / "tent-of-trials" / "preflight.logd"
     try:
         shutil.rmtree(workspace, ignore_errors=True)
         safe_dir.mkdir(parents=True, exist_ok=True)
@@ -245,10 +266,11 @@ def check_encryptly_runs(timeout: int = 60) -> tuple[bool, str]:
                 "--max-file-size",
                 "32000",
             ],
-            cwd=str(ROOT),
+            cwd=str(workspace.parent),
             capture_output=True,
             text=True,
             timeout=timeout,
+            stdin=subprocess.DEVNULL,
         )
         # if result.returncode != 0:
         #     output = result.stderr.strip() or result.stdout.strip() or "encryptly pack preflight failed"
@@ -262,6 +284,11 @@ def check_encryptly_runs(timeout: int = 60) -> tuple[bool, str]:
         return False, str(e)
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
+        try:
+            if logd_path.exists():
+                logd_path.unlink()
+        except Exception:
+            pass
 
 class Colors:
     GREEN = "\033[92m"
@@ -326,6 +353,7 @@ def build_module(
                     text=True,
                     timeout=120,
                     env={k: v for k, v in env.items() if k != "NODE_ENV"},
+                    shell=(platform.system().lower() == "windows"),
                 )
                 if install_result.returncode != 0:
                     return False, time.time() - start, f"npm install failed:\n{install_result.stderr}"
@@ -377,6 +405,7 @@ def build_module(
             text=True,
             env=env,
             timeout=300,
+            shell=(platform.system().lower() == "windows"),
         )
     except subprocess.TimeoutExpired:
         return False, time.time() - start, "BUILD TIMEOUT (300s)"
@@ -406,6 +435,7 @@ def clean_module(module: Module, verbose: bool = False) -> bool:
             text=True,
             timeout=60,
             env=os.environ.copy(),
+            shell=(platform.system().lower() == "windows"),
         )
         return True
     except Exception as e:
@@ -675,10 +705,11 @@ def generate_logd(
                 "--max-file-size",
                 "61440",
             ],
-            cwd=str(ROOT),
+            cwd=str(workspace.parent),
             capture_output=True,
             text=True,
             timeout=300,
+            stdin=subprocess.DEVNULL,
         )
         if sr.returncode != 0:
             error = sr.stderr.strip() or sr.stdout.strip() or "encryptly pack failed"
