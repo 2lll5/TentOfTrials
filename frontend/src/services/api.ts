@@ -234,6 +234,15 @@ async function request<T>(
       const response = await fetch(requestConfig.url, requestConfig);
       clearTimeout(timeoutId);
 
+      if (!response.ok) {
+        const apiError = await parseErrorResponse(response);
+        let processedError = apiError;
+        for (const interceptor of errorInterceptors) {
+          processedError = interceptor(processedError);
+        }
+        throw new ApiHttpError(processedError);
+      }
+
       const responseData = await parseResponse<T>(response);
 
       // Apply response interceptors
@@ -244,6 +253,9 @@ async function request<T>(
 
       return apiResponse;
     } catch (error) {
+      if (error instanceof ApiHttpError) {
+        throw error.toJSON();
+      }
       lastError = error as Error;
 
       if (attempt < maxRetries && method === 'GET') {
@@ -311,6 +323,85 @@ async function parseResponse<T>(response: Response): Promise<ApiResponse<T>> {
     requestId: response.headers.get('X-Request-ID') || undefined,
     pagination,
   };
+}
+
+async function parseErrorResponse(response: Response): Promise<ApiError> {
+  const requestId = response.headers.get('X-Request-ID') || undefined;
+  const contentType = response.headers.get('content-type') || '';
+  let body: unknown;
+  let rawText = '';
+
+  try {
+    if (contentType.includes('application/json')) {
+      body = await response.json();
+    } else {
+      rawText = await response.text();
+      try {
+        body = JSON.parse(rawText);
+      } catch {
+        body = undefined;
+      }
+    }
+  } catch {
+    body = undefined;
+  }
+
+  let message: string;
+  let details: Record<string, unknown> | undefined;
+  let suggestion: string | undefined;
+
+  if (body && typeof body === 'object') {
+    const b = body as Record<string, unknown>;
+    message = (typeof b.message === 'string' && b.message) || (typeof b.error === 'string' && b.error) || response.statusText || 'Request failed';
+    details = (typeof b.details === 'object' && b.details !== null ? b.details as Record<string, unknown> : undefined)
+      || (typeof b.errors === 'object' && b.errors !== null ? { errors: b.errors } : undefined);
+    suggestion = typeof b.suggestion === 'string' ? b.suggestion : undefined;
+  } else if (rawText) {
+    message = rawText.slice(0, 500);
+  } else {
+    message = response.statusText || 'Request failed';
+  }
+
+  return {
+    code: response.status,
+    message,
+    details,
+    requestId,
+    path: response.url || undefined,
+    suggestion,
+  };
+}
+
+export class ApiHttpError extends Error implements ApiError {
+  code: number;
+  details?: Record<string, unknown>;
+  requestId?: string;
+  timestamp?: string;
+  path?: string;
+  suggestion?: string;
+
+  constructor(apiError: ApiError) {
+    super(apiError.message);
+    this.name = 'ApiHttpError';
+    this.code = apiError.code;
+    this.details = apiError.details;
+    this.requestId = apiError.requestId;
+    this.timestamp = apiError.timestamp;
+    this.path = apiError.path;
+    this.suggestion = apiError.suggestion;
+  }
+
+  toJSON(): ApiError {
+    return {
+      code: this.code,
+      message: this.message,
+      details: this.details,
+      requestId: this.requestId,
+      timestamp: this.timestamp,
+      path: this.path,
+      suggestion: this.suggestion,
+    };
+  }
 }
 
 function extractPagination(headers: Headers): PaginationInfo | undefined {
