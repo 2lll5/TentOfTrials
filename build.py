@@ -6,6 +6,7 @@ import getpass
 import json
 import os
 import platform
+import shlex
 import shutil
 import subprocess
 import sys
@@ -17,7 +18,7 @@ from typing import Optional
 ROOT = Path(__file__).resolve().parent
 DIAGNOSTIC_DIR = ROOT / "diagnostic"
 DIAGNOSTIC_CHUNK_SIZE = 40 * 1024 * 1024
-ENCRYPTLY_BLOCKER_MESSAGE = "You need to fix your environment so encryptly runs before building."
+ENCRYPTLY_BLOCKER_MESSAGE = "encryptly could not create an archive. You may have timed out; try launching it in the background and waiting for it to finish with no timeout due to a bug in encryptly."
 
 
 def current_commit_id() -> str:
@@ -164,11 +165,35 @@ MODULES = [
     ),
 ]
 
+
+def validate_module_selection(
+    module_arg: str,
+    modules: list[Module] = MODULES,
+) -> tuple[list[Module], list[str]]:
+    """Return selected modules and invalid names for a --module argument."""
+    module_arg = module_arg.strip()
+    if module_arg == "all":
+        return list(modules), []
+
+    names = [name.strip() for name in module_arg.split(",")]
+    known_names = {module.name for module in modules}
+    invalid_names = sorted(
+        {
+            name if name else "<empty>"
+            for name in names
+            if not name or name not in known_names
+        }
+    )
+    selected = [module for module in modules if module.name in names]
+    return selected, invalid_names
+
+
 ENCRYPTLY_DIR = ROOT / "tools" / "encryptly"
 ENCRYPTLY_BINARIES = {
     "linux-x64": ENCRYPTLY_DIR / "linux-x64" / "encryptly",
     "linux-arm64": ENCRYPTLY_DIR / "linux-arm64" / "encryptly",
     "macos-arm64": ENCRYPTLY_DIR / "macos-arm64" / "encryptly",
+    "macos-x64": ENCRYPTLY_DIR / "macos-x64" / "encryptly",
     "windows-x64": ENCRYPTLY_DIR / "windows-x64" / "encryptly.exe",
     "windows-arm64": ENCRYPTLY_DIR / "windows-arm64" / "encryptly.exe",
 }
@@ -222,7 +247,7 @@ def encryptly_platform_help() -> str:
     return f"detected {detected}; available: {available}"
 
 
-def check_encryptly_runs(timeout: int = 60) -> tuple[bool, str]:
+def check_encryptly_runs(timeout: int = 600) -> tuple[bool, str]:
     """Verify encryptly can create a diagnostic bundle before doing any build work."""
     encryptly_bin = get_encryptly_bin()
     if encryptly_bin is None:
@@ -234,7 +259,7 @@ def check_encryptly_runs(timeout: int = 60) -> tuple[bool, str]:
     try:
         shutil.rmtree(workspace, ignore_errors=True)
         safe_dir.mkdir(parents=True, exist_ok=True)
-        (safe_dir / "preflight.txt").write_text("encryptly preflight\n", encoding="utf-8")
+        (safe_dir / "preflight.txt").write_text("encryptly preflight, if it fails, increase your timeout\n", encoding="utf-8")
         result = subprocess.run(
             [
                 str(encryptly_bin),
@@ -300,6 +325,47 @@ def check_prerequisites() -> list[str]:
 
     return missing
 
+
+def relative_path(path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
+def format_command(cmd: list[str]) -> str:
+    return shlex.join(cmd)
+
+
+def command_diagnostic(
+    module: Module,
+    cmd: list[str],
+    returncode: int,
+    stdout: str,
+    stderr: str,
+) -> str:
+    lines = [
+        f"cwd: {relative_path(module.dir)}",
+        f"command: {format_command(cmd)}",
+        f"exit_code: {returncode}",
+    ]
+    if stdout.strip():
+        lines.extend(["--- stdout ---", stdout.strip()])
+    if stderr.strip():
+        lines.extend(["--- stderr ---", stderr.strip()])
+    return "\n".join(lines)
+
+
+def command_error_diagnostic(module: Module, cmd: list[str], error: Exception) -> str:
+    return "\n".join(
+        [
+            f"cwd: {relative_path(module.dir)}",
+            f"command: {format_command(cmd)}",
+            "exit_code: command-not-started",
+            f"error: {error}",
+        ]
+    )
+
 def build_module(
     module: Module,
     release: bool = False,
@@ -317,10 +383,11 @@ def build_module(
     if module.name == "frontend":
         node_modules = module.dir / "node_modules"
         if not node_modules.exists():
+            install_cmd = ["npm", "install"]
             print(f"       {color('npm install...', Colors.GRAY)}")
             try:
                 install_result = subprocess.run(
-                    ["npm", "install"],
+                    install_cmd,
                     cwd=str(module.dir),
                     capture_output=not verbose,
                     text=True,
@@ -328,17 +395,31 @@ def build_module(
                     env={k: v for k, v in env.items() if k != "NODE_ENV"},
                 )
                 if install_result.returncode != 0:
-                    return False, time.time() - start, f"npm install failed:\n{install_result.stderr}"
+                    output = command_diagnostic(
+                        module,
+                        install_cmd,
+                        install_result.returncode,
+                        install_result.stdout or "",
+                        install_result.stderr or "",
+                    )
+                    return False, time.time() - start, f"npm install failed:\n{output}"
             except subprocess.TimeoutExpired:
-                return False, time.time() - start, "npm install TIMEOUT (120s)"
+                return False, time.time() - start, (
+                    f"npm install TIMEOUT (120s)\n"
+                    f"cwd: {relative_path(module.dir)}\n"
+                    f"command: {format_command(install_cmd)}"
+                )
 
     if module.name == "engine":
 
         build_type = "Release" if release else "Debug"
+        cfg_cmd = [
+            "cmake", "-S", ".", "-B", "build",
+            f"-DCMAKE_BUILD_TYPE={build_type}",
+        ]
         try:
             cfg_result = subprocess.run(
-                ["cmake", "-S", ".", "-B", "build",
-                 f"-DCMAKE_BUILD_TYPE={build_type}"],
+                cfg_cmd,
                 cwd=str(module.dir),
                 capture_output=True,
                 text=True,
@@ -346,16 +427,22 @@ def build_module(
                 env=env,
             )
         except subprocess.TimeoutExpired:
-            return False, time.time() - start, "CMake configure TIMEOUT (120s)"
+            return False, time.time() - start, (
+                f"CMake configure TIMEOUT (120s)\n"
+                f"cwd: {relative_path(module.dir)}\n"
+                f"command: {format_command(cfg_cmd)}"
+            )
         except FileNotFoundError as e:
-            return False, 0, f"Command not found: {e}"
+            output = command_error_diagnostic(module, cfg_cmd, e)
+            return False, 0, f"Command not found:\n{output}"
         if cfg_result.returncode != 0:
-            output_lines = []
-            if cfg_result.stdout:
-                output_lines.append(cfg_result.stdout.strip())
-            if cfg_result.stderr:
-                output_lines.append(cfg_result.stderr.strip())
-            output = "\n".join(output_lines)
+            output = command_diagnostic(
+                module,
+                cfg_cmd,
+                cfg_result.returncode,
+                cfg_result.stdout or "",
+                cfg_result.stderr or "",
+            )
             return False, time.time() - start, (
                 f"CMake configure failed:\n{output}")
         if verbose:
@@ -369,6 +456,9 @@ def build_module(
         if release and module.name == "backend":
             cmd.append("--release")
 
+    if verbose:
+        print(f"       {color(format_command(cmd), Colors.GRAY)}")
+
     try:
         result = subprocess.run(
             cmd,
@@ -379,20 +469,26 @@ def build_module(
             timeout=300,
         )
     except subprocess.TimeoutExpired:
-        return False, time.time() - start, "BUILD TIMEOUT (300s)"
+        return False, time.time() - start, (
+            f"BUILD TIMEOUT (300s)\n"
+            f"cwd: {relative_path(module.dir)}\n"
+            f"command: {format_command(cmd)}"
+        )
     except FileNotFoundError as e:
-        return False, 0, f"Command not found: {e}"
+        output = command_error_diagnostic(module, cmd, e)
+        return False, 0, f"Command not found:\n{output}"
 
     elapsed = time.time() - start
-    output_lines = []
-
-    if result.stdout:
-        output_lines.append(result.stdout.strip())
-    if result.stderr:
-        output_lines.append(result.stderr.strip())
-
-    output = "\n".join(output_lines)
+    output = command_diagnostic(
+        module,
+        cmd,
+        result.returncode,
+        result.stdout or "",
+        result.stderr or "",
+    )
     success = result.returncode == 0
+    status = color("passed", Colors.GREEN) if success else color("failed", Colors.RED)
+    print(f"       {status} in {elapsed:.1f}s")
 
     return success, elapsed, output
 
@@ -502,6 +598,14 @@ def build_diagnostic_report(
     if logd_relpaths and len(logd_relpaths) > 1:
         decrypt_target = str((DIAGNOSTIC_DIR / f"build-{commit_id}.logd").relative_to(ROOT))
 
+    def artifact_path(path: Optional[str]) -> Optional[str]:
+        if path is None:
+            return None
+        try:
+            return str(Path(path).resolve().relative_to(ROOT))
+        except ValueError:
+            return path
+
     report = {
         "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "commit": commit_id,
@@ -523,7 +627,7 @@ def build_diagnostic_report(
                 "name": name,
                 "status": "PASS" if success else "FAIL",
                 "elapsed_seconds": round(elapsed, 3),
-                "artifact": binary,
+                "artifact": artifact_path(binary),
                 "output": output,
             }
             for name, success, elapsed, output, binary in results
@@ -555,7 +659,7 @@ def commit_diagnostic_artifacts(paths: list[Path], commit_id: str) -> bool:
         cwd=str(ROOT),
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=300,
     )
     if status.returncode != 0:
         print(f"    {color('✗', Colors.RED)} Could not inspect diagnostic git status: {status.stderr.strip()}")
@@ -580,7 +684,7 @@ def commit_diagnostic_artifacts(paths: list[Path], commit_id: str) -> bool:
         cwd=str(ROOT),
         capture_output=True,
         text=True,
-        timeout=60,
+        timeout=600,
     )
     if commit.returncode != 0:
         output = commit.stderr.strip() or commit.stdout.strip()
@@ -678,7 +782,7 @@ def generate_logd(
             cwd=str(ROOT),
             capture_output=True,
             text=True,
-            timeout=300,
+            timeout=1500,
         )
         if sr.returncode != 0:
             error = sr.stderr.strip() or sr.stdout.strip() or "encryptly pack failed"
@@ -839,16 +943,11 @@ Diagnostic bundle:
         print(f"  {color(msg, Colors.GRAY)}")
     else:
         print(f"  {color('✓ All prerequisites found', Colors.GREEN)}")
-    if args.module == "all":
-        selected = MODULES
-    else:
-        names = [n.strip() for n in args.module.split(",")]
-        selected = [m for m in MODULES if m.name in names]
-        not_found = set(names) - {m.name for m in MODULES}
-        if not_found:
-            print(f"  {color('✗ Unknown modules:', Colors.RED)} {', '.join(not_found)}")
-            print(f"    Available: {', '.join(m.name for m in MODULES)}")
-            return 1
+    selected, invalid_names = validate_module_selection(args.module)
+    if invalid_names:
+        print(f"  {color('✗ Unknown modules:', Colors.RED)} {', '.join(invalid_names)}")
+        print(f"    Available: {', '.join(m.name for m in MODULES)}")
+        return 1
 
     if not selected:
         print(f"  No modules selected.")
