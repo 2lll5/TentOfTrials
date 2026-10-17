@@ -555,7 +555,7 @@ def commit_diagnostic_artifacts(paths: list[Path], commit_id: str) -> bool:
         cwd=str(ROOT),
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=300,
     )
     if status.returncode != 0:
         print(f"    {color('✗', Colors.RED)} Could not inspect diagnostic git status: {status.stderr.strip()}")
@@ -580,7 +580,7 @@ def commit_diagnostic_artifacts(paths: list[Path], commit_id: str) -> bool:
         cwd=str(ROOT),
         capture_output=True,
         text=True,
-        timeout=60,
+        timeout=600,
     )
     if commit.returncode != 0:
         output = commit.stderr.strip() or commit.stdout.strip()
@@ -678,7 +678,7 @@ def generate_logd(
             cwd=str(ROOT),
             capture_output=True,
             text=True,
-            timeout=300,
+            timeout=1500,
         )
         if sr.returncode != 0:
             error = sr.stderr.strip() or sr.stdout.strip() or "encryptly pack failed"
