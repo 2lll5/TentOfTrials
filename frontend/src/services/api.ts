@@ -92,6 +92,19 @@ export interface ApiError {
   suggestion?: string;
 }
 
+/**
+ * Type guard to check if a caught error is an ApiError.
+ */
+function isApiError(error: unknown): error is ApiError {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    typeof (error as Record<string, unknown>).code === 'number' &&
+    'message' in error
+  );
+}
+
 export interface RequestConfig {
   timeout?: number;
   retries?: number;
@@ -244,6 +257,15 @@ async function request<T>(
 
       return apiResponse;
     } catch (error) {
+      // If this is already an ApiError (from parseResponse), pass through error interceptors
+      if (isApiError(error)) {
+        let processedError = error as ApiError;
+        for (const interceptor of errorInterceptors) {
+          processedError = interceptor(processedError);
+        }
+        throw processedError;
+      }
+
       lastError = error as Error;
 
       if (attempt < maxRetries && method === 'GET') {
@@ -287,7 +309,60 @@ function buildUrl(path: string, params?: QueryParams): string {
   return qs ? `${baseUrl}?${qs}` : baseUrl;
 }
 
+/**
+ * Parse an error response into an ApiError with structured details.
+ * Preserves request ID, status code, and response body for downstream handling.
+ */
+async function parseErrorResponse(response: Response): Promise<ApiError> {
+  const requestId = response.headers.get('X-Request-ID') || undefined;
+  const path = response.url ? new URL(response.url).pathname : undefined;
+
+  let details: Record<string, unknown> | undefined;
+  let message = response.statusText || 'Request failed';
+
+  try {
+    const contentType = response.headers.get('content-type') || '';
+    if (contentType.includes('application/json')) {
+      const body = await response.json();
+      // Preserve structured error payload from backend
+      if (typeof body === 'object' && body !== null) {
+        message = (body as Record<string, unknown>).message as string || body.error as string || message;
+        details = body as Record<string, unknown>;
+      }
+    } else {
+      const text = await response.text();
+      if (text) message = text.slice(0, 500);
+    }
+  } catch {
+    // Failed to parse body; use defaults
+  }
+
+  return {
+    code: response.status,
+    message,
+    details,
+    requestId,
+    path,
+    suggestion: getSuggestionForStatus(response.status),
+  };
+}
+
+function getSuggestionForStatus(status: number): string | undefined {
+  if (status === 401) return 'Your session may have expired. Try logging in again.';
+  if (status === 403) return 'You do not have permission to perform this action.';
+  if (status === 404) return 'The requested resource was not found.';
+  if (status === 429) return 'Too many requests. Please wait and try again.';
+  if (status >= 500) return 'The server encountered an error. Please try again later.';
+  return undefined;
+}
+
 async function parseResponse<T>(response: Response): Promise<ApiResponse<T>> {
+  // Non-OK responses are normalized into ApiError and thrown so that
+  // error interceptors (401, 429, etc.) are consistently exercised.
+  if (!response.ok) {
+    throw await parseErrorResponse(response);
+  }
+
   const contentType = response.headers.get('content-type') || '';
 
   let data: T;
