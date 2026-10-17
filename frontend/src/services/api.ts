@@ -234,6 +234,15 @@ async function request<T>(
       const response = await fetch(requestConfig.url, requestConfig);
       clearTimeout(timeoutId);
 
+      if (!response.ok) {
+        const apiError = await parseErrorResponse(response, path);
+        let processedError = apiError;
+        for (const interceptor of errorInterceptors) {
+          processedError = interceptor(processedError);
+        }
+        throw processedError;
+      }
+
       const responseData = await parseResponse<T>(response);
 
       // Apply response interceptors
@@ -244,6 +253,10 @@ async function request<T>(
 
       return apiResponse;
     } catch (error) {
+      if (isApiError(error)) {
+        throw error;
+      }
+
       lastError = error as Error;
 
       if (attempt < maxRetries && method === 'GET') {
@@ -263,6 +276,13 @@ async function request<T>(
   }
 
   throw processedError;
+}
+
+function isApiError(error: unknown): error is ApiError {
+  return typeof error === 'object'
+    && error !== null
+    && typeof (error as ApiError).code === 'number'
+    && typeof (error as ApiError).message === 'string';
 }
 
 function buildUrl(path: string, params?: QueryParams): string {
@@ -311,6 +331,71 @@ async function parseResponse<T>(response: Response): Promise<ApiResponse<T>> {
     requestId: response.headers.get('X-Request-ID') || undefined,
     pagination,
   };
+}
+
+async function parseErrorResponse(response: Response, requestPath: string): Promise<ApiError> {
+  const contentType = response.headers.get('content-type') || '';
+  let parsedBody: unknown;
+  let textBody: string | undefined;
+
+  try {
+    if (contentType.includes('application/json')) {
+      parsedBody = await response.json();
+    } else {
+      const text = await response.text();
+      textBody = text.trim() || undefined;
+    }
+  } catch {
+    // Some error responses have empty or malformed bodies. The status line
+    // still gives callers a deterministic ApiError below.
+  }
+
+  const body = isRecord(parsedBody) ? parsedBody : undefined;
+  const message = readString(body, ['message', 'error', 'detail', 'title'])
+    ?? textBody
+    ?? response.statusText
+    ?? `Request failed with status ${response.status}`;
+  const requestId = response.headers.get('X-Request-ID')
+    ?? response.headers.get('X-Request-Id')
+    ?? readString(body, ['requestId', 'request_id']);
+  const path = readString(body, ['path']) ?? requestPath;
+  const timestamp = readString(body, ['timestamp']);
+  const suggestion = readString(body, ['suggestion']);
+  const bodyDetails = body?.details;
+
+  let details: Record<string, unknown> | undefined;
+  if (isRecord(bodyDetails)) {
+    details = bodyDetails;
+  } else if (body) {
+    details = body;
+  } else if (textBody) {
+    details = { body: textBody };
+  }
+
+  return {
+    code: response.status,
+    message,
+    details,
+    requestId: requestId || undefined,
+    timestamp,
+    path,
+    suggestion,
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function readString(source: Record<string, unknown> | undefined, keys: string[]): string | undefined {
+  if (!source) return undefined;
+  for (const key of keys) {
+    const value = source[key];
+    if (typeof value === 'string' && value.trim()) {
+      return value;
+    }
+  }
+  return undefined;
 }
 
 function extractPagination(headers: Headers): PaginationInfo | undefined {
