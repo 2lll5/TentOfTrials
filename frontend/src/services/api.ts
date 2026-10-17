@@ -256,8 +256,13 @@ async function request<T>(
     }
   }
 
-  const apiError = normalizeError(lastError);
-  let processedError = apiError;
+  // HARDEN: ensure error is a proper ApiError with code
+  let processedError: ApiError;
+  if (lastError && typeof lastError === 'object' && 'code' in lastError) {
+    processedError = lastError as ApiError;
+  } else {
+    processedError = normalizeError(lastError);
+  }
   for (const interceptor of errorInterceptors) {
     processedError = interceptor(processedError);
   }
@@ -290,6 +295,29 @@ function buildUrl(path: string, params?: QueryParams): string {
 async function parseResponse<T>(response: Response): Promise<ApiResponse<T>> {
   const contentType = response.headers.get('content-type') || '';
 
+  // HARDEN: reject non-2xx responses as proper ApiError
+  if (!response.ok) {
+    let errorBody: Record<string, unknown> = {};
+    try {
+      if (contentType.includes('application/json')) {
+        errorBody = await response.json();
+      } else {
+        const text = await response.text();
+        errorBody = { message: text };
+      }
+    } catch {
+      // response body unreadable — use status info only
+    }
+    throw {
+      code: response.status,
+      message: (errorBody.message as string) || response.statusText || `HTTP ${response.status}`,
+      details: errorBody.details as Record<string, unknown> || errorBody,
+      requestId: response.headers.get('X-Request-ID') || undefined,
+      path: response.url,
+      suggestion: getSuggestionForStatus(response.status),
+    } as ApiError;
+  }
+
   let data: T;
   if (contentType.includes('application/json')) {
     data = await response.json();
@@ -298,7 +326,6 @@ async function parseResponse<T>(response: Response): Promise<ApiResponse<T>> {
   } else if (contentType.includes('multipart/form-data')) {
     data = (await response.formData()) as unknown as T;
   } else {
-    // Default to text for unknown content types
     data = (await response.text()) as unknown as T;
   }
 
@@ -311,6 +338,16 @@ async function parseResponse<T>(response: Response): Promise<ApiResponse<T>> {
     requestId: response.headers.get('X-Request-ID') || undefined,
     pagination,
   };
+}
+
+function getSuggestionForStatus(status: number): string {
+  if (status === 400) return 'Please check your request parameters.';
+  if (status === 401) return 'Please check your authentication credentials.';
+  if (status === 403) return 'You do not have permission to perform this action.';
+  if (status === 404) return 'The requested resource was not found.';
+  if (status === 429) return 'Rate limit exceeded. Please retry after a moment.';
+  if (status >= 500) return 'Server error. Please try again later.';
+  return 'Please try again or contact support.';
 }
 
 function extractPagination(headers: Headers): PaginationInfo | undefined {
