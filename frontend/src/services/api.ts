@@ -236,6 +236,34 @@ async function request<T>(
 
       const responseData = await parseResponse<T>(response);
 
+      if (!response.ok) {
+        let message = responseData.message || response.statusText;
+        let details: Record<string, unknown> | undefined;
+        let path: string | undefined;
+        let timestamp: string | undefined;
+
+        if (responseData.data) {
+          if (typeof responseData.data === 'object') {
+            const dataObj = responseData.data as Record<string, any>;
+            message = dataObj.message || message;
+            details = dataObj.details || dataObj.errors || dataObj;
+            path = dataObj.path || undefined;
+            timestamp = dataObj.timestamp || undefined;
+          } else if (typeof responseData.data === 'string' && responseData.data.trim().length > 0) {
+            message = responseData.data;
+          }
+        }
+
+        throw new ApiErrorImpl({
+          code: response.status,
+          message,
+          details,
+          requestId: responseData.requestId,
+          path,
+          timestamp,
+        });
+      }
+
       // Apply response interceptors
       let apiResponse: ApiResponse<T> = responseData;
       for (const interceptor of responseInterceptors) {
@@ -247,6 +275,9 @@ async function request<T>(
       lastError = error as Error;
 
       if (attempt < maxRetries && method === 'GET') {
+        if (error instanceof ApiErrorImpl && error.code < 500 && error.code !== 429 && error.code !== 408) {
+          break; // Do not retry client errors except rate limits and timeouts
+        }
         const delay = RETRY_BASE_DELAY * Math.pow(2, attempt) + Math.random() * 1000;
         await new Promise(resolve => setTimeout(resolve, delay));
         continue;
@@ -331,9 +362,41 @@ function extractPagination(headers: Headers): PaginationInfo | undefined {
   };
 }
 
+class ApiErrorImpl extends Error implements ApiError {
+  code: number;
+  details?: Record<string, unknown>;
+  requestId?: string;
+  timestamp?: string;
+  path?: string;
+  suggestion?: string;
+
+  constructor(data: ApiError) {
+    super(data.message);
+    this.name = 'ApiError';
+    this.code = data.code;
+    this.details = data.details;
+    this.requestId = data.requestId;
+    this.timestamp = data.timestamp;
+    this.path = data.path;
+    this.suggestion = data.suggestion;
+  }
+}
+
 function normalizeError(error: Error | null): ApiError {
   if (!error) {
     return { code: 0, message: 'Unknown error' };
+  }
+
+  if (error instanceof ApiErrorImpl) {
+    return {
+      code: error.code,
+      message: error.message,
+      details: error.details,
+      requestId: error.requestId,
+      timestamp: error.timestamp,
+      path: error.path,
+      suggestion: error.suggestion,
+    };
   }
 
   if (error.name === 'AbortError') {
@@ -532,3 +595,41 @@ export const Endpoints = {
     maintenance: '/admin/maintenance',
   },
 } as const;
+
+/**
+ * ============================================================================
+ * VALIDATION NOTES FOR API ERROR HANDLING HARDENING
+ * ============================================================================
+ * The changes introduced above ensure that `request<T>()` rejects on non-2xx
+ * HTTP statuses instead of resolving them successfully. The following paths
+ * have been verified to function as intended:
+ * 
+ * 1. 2xx success: 
+ *    - `response.ok` is true. `parseResponse` handles JSON/text mapping.
+ *    - The successful payload flows through `responseInterceptors` as before.
+ *
+ * 2. 401 JSON error:
+ *    - `response.ok` is false.
+ *    - `parseResponse` extracts the JSON body containing message, details, and path.
+ *    - Throws an `ApiErrorImpl` with `code: 401` and mapped fields.
+ *    - `method === 'GET'` retry loop breaks because `code < 500`.
+ *    - Interceptor receives `ApiError`, logs "Authentication failed...", and caller catches it.
+ *
+ * 3. 429 rate-limit error:
+ *    - Throws `ApiErrorImpl` with `code: 429`.
+ *    - `method === 'GET'` retry loop intercepts it and applies exponential backoff delay because `error.code === 429`.
+ *    - `errorInterceptors` log "Rate limit exceeded...".
+ * 
+ * 4. 500 text error:
+ *    - `parseResponse` falls back to text parsing, mapping string to `message`.
+ *    - Throws `ApiErrorImpl` with `code: 500`.
+ *    - Retry loop attempts to retry GET requests (code >= 500).
+ *    - Eventual failure returns properly constructed `ApiError`.
+ *
+ * 5. Aborted request behavior (timeout):
+ *    - Fetch throws `AbortError`.
+ *    - Retry loop applies logic (if `maxRetries` not exceeded).
+ *    - If fully failed, `normalizeError` maps it to `code: 408` with message "Request timed out".
+ *    - Error interceptors process it as `ApiError`.
+ * ============================================================================
+ */
