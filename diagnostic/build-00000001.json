@@ -1,0 +1,22 @@
+{
+  "generated_at": "2026-06-16T16:00:00.000000+00:00",
+  "commit": "00000001",
+  "diagnostic_logd": "diagnostic/build-00000001.logd",
+  "diagnostic_logd_error": null,
+  "chunked": false,
+  "chunk_size_bytes": null,
+  "password": "abc123def456",
+  "decrypt_command": "encryptly unpack diagnostic/build-00000001.logd <outdir> --password abc123def456",
+  "total_modules": 1,
+  "passed": 1,
+  "failed": 0,
+  "modules": [
+    {
+      "name": "frontend",
+      "status": "PASS",
+      "elapsed_seconds": 2,
+      "artifact": null,
+      "output": "TypeScript compilation successful"
+    }
+  ]
+}
